@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ideas CRUD Demo</title>
+  </head>
+  <body>
+    <h1>Ideas CRUD Demo</h1>
+
+    <form id="idea-form">
+      <label>
+        Title
+        <input id="title" name="title" required maxlength="120" />
+      </label>
+      <label>
+        Description
+        <input id="description" name="description" maxlength="1000" />
+      </label>
+      <button type="submit">Create idea</button>
+    </form>
+
+    <h2>Existing ideas</h2>
+    <ul id="ideas-list"></ul>
+
+    <script>
+      async function loadIdeas() {
+        const response = await fetch("/api/ideas");
+        const ideas = await response.json();
+        const list = document.getElementById("ideas-list");
+        list.innerHTML = "";
+        ideas.forEach((idea) => {
+          const li = document.createElement("li");
+          li.textContent = `${idea.id}: ${idea.title}${idea.description ? " - " + idea.description : ""}`;
+          const deleteButton = document.createElement("button");
+          deleteButton.textContent = "Delete";
+          deleteButton.onclick = async () => {
+            await fetch(`/api/ideas/${idea.id}`, { method: "DELETE" });
+            await loadIdeas();
+          };
+          li.appendChild(document.createTextNode(" "));
+          li.appendChild(deleteButton);
+          list.appendChild(li);
+        });
+      }
+
+      document.getElementById("idea-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const title = document.getElementById("title").value;
+        const description = document.getElementById("description").value;
+        await fetch("/api/ideas", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title, description }),
+        });
+        event.target.reset();
+        await loadIdeas();
+      });
+
+      loadIdeas();
+    </script>
+  </body>
+</html>
