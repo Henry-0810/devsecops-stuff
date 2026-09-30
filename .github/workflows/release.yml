@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+# Serialize releases for a ref; never interrupt an image push halfway through.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Validate release commit
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish release image
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.push.outputs.digest }}
+      reference: ${{ steps.push.outputs.reference }}
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set image name and validate version tag
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+              echo "Expected a version tag such as v1.2.3 or v1.2.3-rc.1"
+              exit 1
+            fi
+          fi
+
+      - name: Generate image tags and OCI labels
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build release image locally
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
+          provenance: false
+          sbom: false
+
+      - name: Smoke test release image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+        run: make docker-test
+
+      # FUTURE CONTAINER SECURITY: scan the built image here and fail before login/push.
+      # FUTURE SBOM: generate an SBOM from this exact local image here.
+      # No scanning, SBOM generation, attestations, or signing is implemented yet.
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push tested image and record immutable reference
+        id: push
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+        shell: bash
+        run: |
+          # Push the exact local image tested above, without rebuilding it.
+          while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            docker push "$tag"
+          done <<< "$IMAGE_TAGS"
+          reference=$(docker image inspect "$IMAGE_NAME:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')
+          [[ "$reference" == "$IMAGE_NAME@sha256:"* ]]
+          echo "reference=$reference" >> "$GITHUB_OUTPUT"
+          echo "digest=${reference##*@}" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Published image'
+            echo "Commit: $GITHUB_SHA"
+            echo '```text'
+            echo "$IMAGE_TAGS"
+            echo "$reference"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # FUTURE SIGNING: sign steps.push.outputs.reference after its digest exists.
+      # FUTURE DEPLOYMENT: pass the digest reference to Helm/GitOps in a separate job.
